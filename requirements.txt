@@ -1,0 +1,4 @@
+pillow>=5.1.0
+keras>=2.2.4
+numpy>=1.15.2
+matplotlib>=2.2.2
