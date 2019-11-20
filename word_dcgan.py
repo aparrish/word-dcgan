@@ -9,11 +9,12 @@ from keras.layers.convolutional import UpSampling2D, Conv2D
 from keras.models import Sequential, Model
 from keras.optimizers import Adam
 
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import ImageFont, ImageDraw, Image
+
 import datetime
 import random
-import pronouncing as pr
-pr.init_cmu()
-from PIL import ImageFont, ImageDraw, Image
 
 def gen_word_image(s, font, w, h, xoff):
     ascent, descent = font.getmetrics()
@@ -43,9 +44,6 @@ def load_vocab_probs():
     probs_arr /= probs_arr.sum()
     return words, probs_arr
 
-import matplotlib.pyplot as plt
-import sys
-import numpy as np
 
 class WordDCGAN():
     def __init__(self, width, height, latent_dim=64):
@@ -144,6 +142,7 @@ class WordDCGAN():
     def train(self, epochs, font, batch_size=128, save_interval=50):
 
         tstamp = datetime.datetime.utcnow().isoformat()[:19]
+        print("starting training at", tstamp)
 
         # Adversarial ground truths
         valid = np.ones((batch_size, 1))
@@ -152,7 +151,8 @@ class WordDCGAN():
         for epoch in range(epochs):
 
             imgs = gen_word_batch(batch_size, font, self.words,
-                    self.word_probs, self.img_cols, self.img_rows)
+                    self.word_probs, self.img_cols, self.img_rows,
+                    int(self.img_cols * 0.05))
 
             # ---------------------
             #  Train Discriminator
@@ -178,16 +178,16 @@ class WordDCGAN():
             print ("%s %d [D loss: %f, acc.: %.2f%%] [G loss: %f]" % (tstamp, epoch, d_loss[0], 100*d_loss[1], g_loss))
 
             # If at save interval => save generated image samples
-            if epoch % save_interval == 0:
+            if epoch % save_interval == (save_interval - 1):
                 print("saving images...")
-                self.save_imgs(epoch)
+                self.save_imgs(epoch+1, tstamp)
                 print("done")
                 print("saving generator model...")
                 self.generator.save(
-                        "models/%s-%05d-generator.h5" % (tstamp, epoch))
+                        "models/%s-%05d-generator.h5" % (tstamp, epoch+1))
                 print("done")
 
-    def save_imgs(self, epoch):
+    def save_imgs(self, epoch, tstamp):
         r, c = 5, 5
         noise = np.random.normal(0, 1, (r * c, self.latent_dim))
         gen_imgs = self.generator.predict(noise)
@@ -202,11 +202,64 @@ class WordDCGAN():
                 axs[i,j].imshow(gen_imgs[cnt, :,:,0], cmap='gray')
                 axs[i,j].axis('off')
                 cnt += 1
-        fig.savefig("images/word_%d.png" % epoch)
+        fig.savefig("images/%s_word_%d.png" % (tstamp, epoch))
         plt.close()
 
 
 if __name__ == '__main__':
-    dcgan = WordDCGAN(64, 16)
-    font = ImageFont.truetype('NotoSans-Regular.ttf', size=10)
-    dcgan.train(epochs=4000, font=font, batch_size=128, save_interval=1)
+    import argparse
+    parser = argparse.ArgumentParser(
+            description='word dcgan training script!')
+    parser.add_argument(
+            '--img-width',
+            type=int,
+            default=128,
+            help='width of generated word bitmaps (should be power of 2)')
+    parser.add_argument(
+            '--img-height',
+            type=int,
+            default=32,
+            help='height of generated word bitmaps (should be power of 2)')
+    parser.add_argument(
+            '--font-file',
+            type=str,
+            default='NotoSans-Regular.ttf',
+            help='truetype font to use')
+    parser.add_argument(
+            '--font-size',
+            type=int,
+            default=18,
+            help='size of font when creating bitmaps')
+    parser.add_argument(
+            '--epochs',
+            type=int,
+            default=5000,
+            help='number of epochs to train')
+    parser.add_argument(
+            '--batch-size',
+            type=int,
+            default=128,
+            help='number of samples per epoch')
+    parser.add_argument(
+            '--save-interval',
+            type=int,
+            default=50,
+            help='save images and model every N epochs')
+    parser.add_argument(
+            '--latent-dim',
+            type=int,
+            default=64,
+            help='latent dimension count')
+    args = parser.parse_args()
+
+    dcgan = WordDCGAN(
+            args.img_width,
+            args.img_height,
+            args.latent_dim)
+    font = ImageFont.truetype(args.font_file, size=args.font_size)
+    dcgan.train(
+            epochs=args.epochs,
+            font=font,
+            batch_size=args.batch_size,
+            save_interval=args.save_interval)
+
