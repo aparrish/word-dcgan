@@ -33,8 +33,11 @@ def gen_word_image(s, font, w, h, xoff, style=lambda x: x):
     return image
 
 def gen_word_batch(size, font, vocab, probs, w=256, h=64, xoff=4,
-        style=lambda x: x):
-    words = np.random.choice(vocab, p=probs, size=size)
+        style=lambda x: x, dist='unigram'):
+    if dist == 'unigram':
+        words = np.random.choice(vocab, p=probs, size=size)
+    else:
+        words = np.random.choice(vocab, size=size)
     bitmaps = np.array(
                 [np.array(gen_word_image(s, font, w, h, xoff, style))
                     for s in words],
@@ -42,14 +45,19 @@ def gen_word_batch(size, font, vocab, probs, w=256, h=64, xoff=4,
     bitmaps = (bitmaps / 127.5) - 1.
     return np.expand_dims(bitmaps, axis=3)
 
-def load_vocab_probs():
+def load_vocab_probs(size, font, w, h, xoff, style):
     words = []
     probs = []
+    image = Image.new('L', (w, h), color=255)
+    draw = ImageDraw.Draw(image)
     with open("cmudict-word-prob.tsv") as fh:
         for line in fh:
             line = line.strip()
-            w, p = line.split("\t")
-            words.append(w)
+            word, p = line.split("\t")
+            if draw.textsize(style(word), font)[0]+xoff > w * 0.9:
+                print("skipping", word, "---too long")
+                continue
+            words.append(word)
             probs.append(float(p))
     probs_arr = np.exp(np.array(probs))
     probs_arr /= probs_arr.sum()
@@ -57,7 +65,7 @@ def load_vocab_probs():
 
 
 class WordDCGAN():
-    def __init__(self, width, height, latent_dim=64):
+    def __init__(self, width, height, words, word_probs, latent_dim=64):
         # Input shape
         self.img_rows = height
         self.img_cols = width
@@ -91,7 +99,8 @@ class WordDCGAN():
         self.combined = Model(z, valid)
         self.combined.compile(loss='binary_crossentropy', optimizer=optimizer)
 
-        self.words, self.word_probs = load_vocab_probs()
+        self.words = words
+        self.word_probs = word_probs
 
     def build_generator(self):
 
@@ -151,7 +160,7 @@ class WordDCGAN():
         return Model(img, validity)
 
     def train(self, epochs, font, batch_size=128, save_interval=50,
-            style=lambda x: x):
+            style=lambda x: x, word_dist='unigram'):
 
         tstamp = datetime.datetime.utcnow().isoformat()[:19]
         print("starting training at", tstamp)
@@ -164,7 +173,7 @@ class WordDCGAN():
 
             imgs = gen_word_batch(batch_size, font, self.words,
                     self.word_probs, self.img_cols, self.img_rows,
-                    int(self.img_cols * 0.05), style)
+                    int(self.img_cols * 0.05), style, word_dist)
 
             # ---------------------
             #  Train Discriminator
@@ -243,6 +252,11 @@ if __name__ == '__main__':
             default='none',
             help='orthographic transformation to apply to words')
     parser.add_argument(
+            '--word-dist',
+            choices=['unigram', 'uniform'],
+            default='freq',
+            help='word distribution (unigram=spacy unigram frequency, uniform=uniform probability)')
+    parser.add_argument(
             '--font-size',
             type=int,
             default=18,
@@ -269,18 +283,30 @@ if __name__ == '__main__':
             help='latent dimension count')
     args = parser.parse_args()
 
-    dcgan = WordDCGAN(
-            args.img_width,
-            args.img_height,
-            args.latent_dim)
+
     font = ImageFont.truetype(args.font_file, size=args.font_size)
     style = {'ucfirst': ucfirst,
              'randpunct': randpunct,
              'none': lambda x: x}[args.text_style]
+
+    words, word_probs = load_vocab_probs(
+            args.font_size,
+            font,
+            args.img_width,
+            args.img_height,
+            args.img_width * 0.05,
+            style)
+
+    dcgan = WordDCGAN(
+            args.img_width,
+            args.img_height,
+            words, word_probs,
+            args.latent_dim)
     dcgan.train(
             epochs=args.epochs,
             font=font,
             batch_size=args.batch_size,
             save_interval=args.save_interval,
-            style=style)
+            style=style,
+            word_dist=args.word_dist)
 
