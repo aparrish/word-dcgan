@@ -16,17 +16,28 @@ from PIL import ImageFont, ImageDraw, Image
 import datetime
 import random
 
-def gen_word_image(s, font, w, h, xoff):
+def ucfirst(s):
+    return s[0].upper() + s[1:]
+
+def randpunct(s):
+    probs = {'!': 0.1746109907425645,
+             '.': 0.7268071695883396,
+             '?': 0.09858183966909592}
+    return s + np.random.choice(list(probs.keys()), p=list(probs.values()))
+
+def gen_word_image(s, font, w, h, xoff, style=lambda x: x):
     ascent, descent = font.getmetrics()
     image = Image.new('L', (w, h), color=255)
     draw = ImageDraw.Draw(image)
-    draw.text((xoff, (h/2) - ascent + descent), s, fill=0, font=font)
+    draw.text((xoff, (h/2) - ascent + descent), style(s), fill=0, font=font)
     return image
 
-def gen_word_batch(size, font, vocab, probs, w=256, h=64, xoff=4):
+def gen_word_batch(size, font, vocab, probs, w=256, h=64, xoff=4,
+        style=lambda x: x):
     words = np.random.choice(vocab, p=probs, size=size)
     bitmaps = np.array(
-                [np.array(gen_word_image(s, font, w, h, xoff)) for s in words],
+                [np.array(gen_word_image(s, font, w, h, xoff, style))
+                    for s in words],
                 dtype=np.float32)
     bitmaps = (bitmaps / 127.5) - 1.
     return np.expand_dims(bitmaps, axis=3)
@@ -139,7 +150,8 @@ class WordDCGAN():
 
         return Model(img, validity)
 
-    def train(self, epochs, font, batch_size=128, save_interval=50):
+    def train(self, epochs, font, batch_size=128, save_interval=50,
+            style=lambda x: x):
 
         tstamp = datetime.datetime.utcnow().isoformat()[:19]
         print("starting training at", tstamp)
@@ -152,7 +164,7 @@ class WordDCGAN():
 
             imgs = gen_word_batch(batch_size, font, self.words,
                     self.word_probs, self.img_cols, self.img_rows,
-                    int(self.img_cols * 0.05))
+                    int(self.img_cols * 0.05), style)
 
             # ---------------------
             #  Train Discriminator
@@ -226,6 +238,11 @@ if __name__ == '__main__':
             default='NotoSans-Regular.ttf',
             help='truetype font to use')
     parser.add_argument(
+            '--text-style',
+            choices=['ucfirst', 'randpunct', 'none'],
+            default='none',
+            help='orthographic transformation to apply to words')
+    parser.add_argument(
             '--font-size',
             type=int,
             default=18,
@@ -257,9 +274,13 @@ if __name__ == '__main__':
             args.img_height,
             args.latent_dim)
     font = ImageFont.truetype(args.font_file, size=args.font_size)
+    style = {'ucfirst': ucfirst,
+             'randpunct': randpunct,
+             'none': lambda x: x}[args.text_style]
     dcgan.train(
             epochs=args.epochs,
             font=font,
             batch_size=args.batch_size,
-            save_interval=args.save_interval)
+            save_interval=args.save_interval,
+            style=style)
 
