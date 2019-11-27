@@ -254,7 +254,7 @@ if __name__ == '__main__':
     parser.add_argument(
             '--word-dist',
             choices=['unigram', 'uniform'],
-            default='freq',
+            default='unigram',
             help='word distribution (unigram=spacy unigram frequency, uniform=uniform probability)')
     parser.add_argument(
             '--font-size',
