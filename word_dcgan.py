@@ -2,7 +2,7 @@
 from __future__ import print_function, division
 
 #from keras.datasets import mnist
-from keras.layers import Input, Dense, Reshape, Flatten, Dropout
+from keras.layers import Input, Dense, Reshape, Flatten, Dropout, Concatenate
 from keras.layers import BatchNormalization, Activation, ZeroPadding2D
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.convolutional import UpSampling2D, Conv2D
@@ -19,33 +19,52 @@ import random
 def ucfirst(s):
     return s[0].upper() + s[1:]
 
+def allcaps(s):
+    return s.upper()
+
 def randpunct(s):
     probs = {'!': 0.1746109907425645,
              '.': 0.7268071695883396,
              '?': 0.09858183966909592}
     return s + np.random.choice(list(probs.keys()), p=list(probs.values()))
 
-def gen_word_image(s, font, w, h, xoff, style=lambda x: x):
-    ascent, descent = font.getmetrics()
+class Style:
+    "a 'style' wraps a text transformation technique with a font"
+    def __init__(self, transform, font, label):
+        self.transform = transform
+        self.font = font
+        self.label = label
+
+def gen_word_image(s, w, h, xoff, style):
+    ascent, descent = style.font.getmetrics()
     image = Image.new('L', (w, h), color=255)
     draw = ImageDraw.Draw(image)
-    draw.text((xoff, (h/2) - ascent + descent), style(s), fill=0, font=font)
+    draw.text((xoff, (h/2) - ascent + descent), style.transform(s),
+            fill=0, font=style.font)
     return image
 
-def gen_word_batch(size, font, vocab, probs, w=256, h=64, xoff=4,
-        style=lambda x: x, dist='unigram'):
+def gen_word_batch(size, vocab, probs, w=256, h=64, xoff=4,
+        styles=None, dist='unigram'):
     if dist == 'unigram':
         words = np.random.choice(vocab, p=probs, size=size)
     else:
         words = np.random.choice(vocab, size=size)
-    bitmaps = np.array(
-                [np.array(gen_word_image(s, font, w, h, xoff, style))
-                    for s in words],
-                dtype=np.float32)
-    bitmaps = (bitmaps / 127.5) - 1.
-    return np.expand_dims(bitmaps, axis=3)
 
-def load_vocab_probs(size, font, w, h, xoff, style):
+    style_indices = np.random.randint(0, len(styles), size=size)
+
+    bitmaps = []
+    labels = []
+    for i, idx in enumerate(style_indices):
+        word_img  = np.array(gen_word_image(words[i], w, h, xoff, styles[idx]))
+        bitmaps.append(word_img)
+        labels.append(styles[idx].label)
+
+    bitmaps = np.array(bitmaps, dtype=np.float32)
+    labels = np.array(labels)
+    bitmaps = (bitmaps / 127.5) - 1.
+    return (np.expand_dims(bitmaps, axis=3), labels)
+
+def load_vocab_probs(size, font, w, h, xoff, styles, debug=False):
     words = []
     probs = []
     image = Image.new('L', (w, h), color=255)
@@ -54,9 +73,12 @@ def load_vocab_probs(size, font, w, h, xoff, style):
         for line in fh:
             line = line.strip()
             word, p = line.split("\t")
-            if draw.textsize(style(word), font)[0]+xoff > w * 0.9:
-                print("skipping", word, "---too long")
-                continue
+            # if it's too big in *any* style, skip
+            for st in styles:
+                if draw.textsize(st.transform(word), st.font)[0]+xoff > w * 0.9:
+                    if debug:
+                        print("skipping", word, "(too long)")
+                    continue
             words.append(word)
             probs.append(float(p))
     probs_arr = np.exp(np.array(probs))
@@ -65,13 +87,16 @@ def load_vocab_probs(size, font, w, h, xoff, style):
 
 
 class WordDCGAN():
-    def __init__(self, width, height, words, word_probs, latent_dim=64):
+    def __init__(self, width, height, words, word_probs, styles, latent_dim=64):
         # Input shape
         self.img_rows = height
         self.img_cols = width
         self.channels = 1
         self.img_shape = (self.img_rows, self.img_cols, self.channels)
         self.latent_dim = latent_dim
+        self.class_dim = len(styles)
+
+        self.styles = styles
 
         optimizer = Adam(0.0002, 0.5)
 
@@ -80,23 +105,26 @@ class WordDCGAN():
         self.discriminator.compile(loss='binary_crossentropy',
             optimizer=optimizer,
             metrics=['accuracy'])
+        self.discriminator.summary()
 
         # Build the generator
         self.generator = self.build_generator()
+        self.generator.summary()
 
         # The generator takes noise as input and generates imgs
         z = Input(shape=(self.latent_dim,))
-        img = self.generator(z)
+        c = Input(shape=(self.class_dim,))
+        img = self.generator([z, c])
 
         # For the combined model we will only train the generator
         self.discriminator.trainable = False
 
         # The discriminator takes generated images as input and determines validity
-        valid = self.discriminator(img)
+        valid = self.discriminator([img, c])
 
         # The combined model  (stacked generator and discriminator)
         # Trains the generator to fool the discriminator
-        self.combined = Model(z, valid)
+        self.combined = Model([z, c], valid)
         self.combined.compile(loss='binary_crossentropy', optimizer=optimizer)
 
         self.words = words
@@ -104,63 +132,79 @@ class WordDCGAN():
 
     def build_generator(self):
 
-        model = Sequential()
         x_val = int(self.img_cols / 4)
         y_val = int(self.img_rows / 4)
 
-        model.add(Dense(128 * y_val * x_val, activation="relu",
-            input_dim=self.latent_dim))
-        model.add(Reshape((y_val, x_val, 128)))
-        model.add(UpSampling2D())
-        model.add(Conv2D(128, kernel_size=3, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(Activation("relu"))
-        model.add(UpSampling2D())
-        model.add(Conv2D(64, kernel_size=3, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(Activation("relu"))
-        model.add(Conv2D(self.channels, kernel_size=3, padding="same"))
-        model.add(Activation("tanh"))
+        # noise input
+        z = Input(shape=(self.latent_dim,))
+        dense_z = Dense(128 * y_val * x_val, activation="relu")(z)
+        bnormal_z = BatchNormalization(momentum=0.8)(dense_z)
+        reshape_z = Reshape((y_val, x_val, 128))(bnormal_z)
 
-        model.summary()
+        # class input
+        c = Input(shape=(self.class_dim,))
+        dense_c = Dense(128 * y_val * x_val, activation="relu")(c)
+        bnormal_c = BatchNormalization(momentum=0.8)(dense_c)
+        reshape_c = Reshape((y_val, x_val, 128))(bnormal_c)
 
-        noise = Input(shape=(self.latent_dim,))
-        img = model(noise)
+        # combined
+        zc = Concatenate()([reshape_z, reshape_c])
 
-        return Model(noise, img)
+        upsample1 = UpSampling2D()(zc)
+        conv2d1 = Conv2D(128, kernel_size=3, padding="same")(upsample1)
+        bnormal1 = BatchNormalization(momentum=0.8)(conv2d1)
+        relu1 = Activation("relu")(bnormal1)
+        upsample2 = UpSampling2D()(relu1)
+        conv2d2 = Conv2D(64, kernel_size=3, padding="same")(upsample2)
+        bnormal2 = BatchNormalization(momentum=0.8)(conv2d2)
+        relu2 = Activation("relu")(bnormal2)
+        conv2d3 = Conv2D(self.channels, kernel_size=3, padding="same",
+                activation="tanh")(relu2)
+
+        return Model([z, c], conv2d3)
 
     def build_discriminator(self):
 
-        model = Sequential()
+        #model = Sequential()
 
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=self.img_shape, padding="same"))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(64, kernel_size=3, strides=2, padding="same"))
-        model.add(ZeroPadding2D(padding=((0,1),(0,1))))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(128, kernel_size=3, strides=2, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(256, kernel_size=3, strides=1, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Flatten())
-        model.add(Dense(1, activation='sigmoid'))
+        input_img = Input(self.img_shape)
+        conv2d_img1 = Conv2D(32, kernel_size=3, strides=2,
+                input_shape=self.img_shape, padding="same")(input_img)
+        lrlu_img1 = LeakyReLU(alpha=0.2)(conv2d_img1)
+        dropout_img1 = Dropout(0.25)(lrlu_img1)
+        conv2d_img2 = Conv2D(64, kernel_size=3, strides=2,
+                padding="same")(dropout_img1)
+        zeropad_img1 = ZeroPadding2D(padding=((0,1),(0,1)))(conv2d_img2)
+        bnormal_img1 = BatchNormalization(momentum=0.8)(zeropad_img1)
+        lrlu_img2 = LeakyReLU(alpha=0.2)(bnormal_img1)
+        dropout_img2 = Dropout(0.25)(lrlu_img2)
+        conv2d_img3 = Conv2D(128, kernel_size=3, strides=2,
+                padding="same")(dropout_img2)
+        bnormal_img2 = BatchNormalization(momentum=0.8)(conv2d_img3)
+        lrlu_img3 = LeakyReLU(alpha=0.2)(bnormal_img2)
+        dropout_img3 = Dropout(0.25)(lrlu_img3)
+        conv2d_img4 = Conv2D(256, kernel_size=3, strides=1,
+                padding="same")(dropout_img3)
+        bnormal_img3 = BatchNormalization(momentum=0.8)(conv2d_img4)
+        lrlu_img4 = LeakyReLU(alpha=0.2)(bnormal_img3)
+        dropout_img4 = Dropout(0.25)(lrlu_img4)
 
-        model.summary()
+        x_val = int(self.img_cols / 8) + 1
+        y_val = int(self.img_rows / 8) + 1
 
-        img = Input(shape=self.img_shape)
-        validity = model(img)
+        c = Input(shape=(self.class_dim,))
+        dense_c = Dense(256 * x_val * y_val, activation="relu")(c)
+        bnormal_c = BatchNormalization(momentum=0.8)(dense_c)
+        reshape_c = Reshape((y_val, x_val, 256))(dense_c)
 
-        return Model(img, validity)
+        imgc = Concatenate()([dropout_img4, reshape_c])
 
-    def train(self, epochs, font, batch_size=128, save_interval=50,
-            style=lambda x: x, word_dist='unigram'):
+        flat = Flatten()(imgc)
+        dense_out = Dense(1, activation='sigmoid')(flat)
+
+        return Model([input_img, c], dense_out)
+
+    def train(self, epochs, batch_size=128, save_interval=50):
 
         tstamp = datetime.datetime.utcnow().isoformat()[:19]
         print("starting training at", tstamp)
@@ -171,9 +215,9 @@ class WordDCGAN():
 
         for epoch in range(epochs):
 
-            imgs = gen_word_batch(batch_size, font, self.words,
+            imgs, classes = gen_word_batch(batch_size, self.words,
                     self.word_probs, self.img_cols, self.img_rows,
-                    int(self.img_cols * 0.05), style, word_dist)
+                    int(self.img_cols * 0.05), self.styles)
 
             # ---------------------
             #  Train Discriminator
@@ -181,11 +225,13 @@ class WordDCGAN():
 
             # Sample noise and generate a batch of new images
             noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-            gen_imgs = self.generator.predict(noise)
+            gen_imgs = self.generator.predict([noise, classes])
 
             # Train the discriminator (real classified as ones and generated as zeros)
-            d_loss_real = self.discriminator.train_on_batch(imgs, valid)
-            d_loss_fake = self.discriminator.train_on_batch(gen_imgs, fake)
+            d_loss_real = self.discriminator.train_on_batch(
+                    [imgs, classes], valid)
+            d_loss_fake = self.discriminator.train_on_batch(
+                    [gen_imgs, classes], fake)
             d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
             # ---------------------
@@ -193,7 +239,7 @@ class WordDCGAN():
             # ---------------------
 
             # Train the generator (wants discriminator to mistake images as real)
-            g_loss = self.combined.train_on_batch(noise, valid)
+            g_loss = self.combined.train_on_batch([noise, classes], valid)
 
             # Plot the progress
             print ("%s %d [D loss: %f, acc.: %.2f%%] [G loss: %f]" % (tstamp, epoch, d_loss[0], 100*d_loss[1], g_loss))
@@ -201,22 +247,24 @@ class WordDCGAN():
             # If at save interval => save generated image samples
             if epoch % save_interval == (save_interval - 1):
                 print("saving images...")
-                self.save_imgs(epoch+1, tstamp)
+                self.save_imgs(self.styles, epoch+1, tstamp)
                 print("done")
                 print("saving generator model...")
                 self.generator.save(
                         "models/%s-%05d-generator.h5" % (tstamp, epoch+1))
                 print("done")
 
-    def save_imgs(self, epoch, tstamp):
+    def save_imgs(self, styles, epoch, tstamp):
         r, c = 5, 5
         noise = np.random.normal(0, 1, (r * c, self.latent_dim))
-        gen_imgs = self.generator.predict(noise)
+        labels = np.array([st.label for st in np.random.choice(styles,
+            size=r*c)])
+        gen_imgs = self.generator.predict([noise, labels])
 
         # Rescale images 0 - 1
         gen_imgs = 0.5 * gen_imgs + 0.5
 
-        fig, axs = plt.subplots(r, c)
+        fig, axs = plt.subplots(r, c, figsize=(12, 8))
         cnt = 0
         for i in range(r):
             for j in range(c):
@@ -286,6 +334,7 @@ if __name__ == '__main__':
 
     font = ImageFont.truetype(args.font_file, size=args.font_size)
     style = {'ucfirst': ucfirst,
+             'allcaps': allcaps,
              'randpunct': randpunct,
              'none': lambda x: x}[args.text_style]
 
