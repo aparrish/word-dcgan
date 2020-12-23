@@ -4,6 +4,7 @@ from __future__ import print_function, division
 #from keras.datasets import mnist
 from keras.layers import Input, Dense, Reshape, Flatten, Dropout, Concatenate
 from keras.layers import BatchNormalization, Activation, ZeroPadding2D
+from keras.layers import Embedding, multiply
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.convolutional import UpSampling2D, Conv2D
 from keras.models import Sequential, Model
@@ -15,6 +16,9 @@ from PIL import ImageFont, ImageDraw, Image
 
 import datetime
 import random
+import json
+
+# text transformation functions
 
 def ucfirst(s):
     return s[0].upper() + s[1:]
@@ -30,12 +34,15 @@ def randpunct(s):
 
 class Style:
     "a 'style' wraps a text transformation technique with a font"
-    def __init__(self, transform, font, label):
+    def __init__(self, desc, transform, font, size, label):
+        self.desc = desc
         self.transform = transform
         self.font = font
         self.label = label
+        self.size = size
 
 def gen_word_image(s, w, h, xoff, style):
+    "generate a word image for the given string using given style and metrics"
     ascent, descent = style.font.getmetrics()
     image = Image.new('L', (w, h), color=255)
     draw = ImageDraw.Draw(image)
@@ -45,6 +52,8 @@ def gen_word_image(s, w, h, xoff, style):
 
 def gen_word_batch(size, vocab, probs, w=256, h=64, xoff=4,
         styles=None, dist='unigram'):
+    "generate a batch of words with given metrics, sampling from given styles"
+
     if dist == 'unigram':
         words = np.random.choice(vocab, p=probs, size=size)
     else:
@@ -64,23 +73,42 @@ def gen_word_batch(size, vocab, probs, w=256, h=64, xoff=4,
     bitmaps = (bitmaps / 127.5) - 1.
     return (np.expand_dims(bitmaps, axis=3), labels)
 
-def load_vocab_probs(size, font, w, h, xoff, styles, debug=False):
+def build_glyph_width_map(style, alphabet, w=128, h=128):
+    "precalculate glyph widths for a given style"
+    image = Image.new('L', (w, h), color=255)
+    draw = ImageDraw.Draw(image)
+    widths = {}
+    for ch in alphabet:
+        widths[ch] = draw.textsize(ch, style.font)[0]
+    return widths
+
+alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-.'"
+
+def load_vocab_probs(w, h, xoff, styles, debug=False):
+    "load probabilities for words, excluding words that won't fit on canvas"
     words = []
     probs = []
+    # pillow textsize takes too long, so we'll just sum up the width of the
+    # characters as a proxy. sorry ramsey
+    glyph_width_maps = [build_glyph_width_map(st, alphabet) for st in styles]
     image = Image.new('L', (w, h), color=255)
     draw = ImageDraw.Draw(image)
     with open("cmudict-word-prob.tsv") as fh:
         for line in fh:
+            skipped = False
             line = line.strip()
             word, p = line.split("\t")
             # if it's too big in *any* style, skip
-            for st in styles:
-                if draw.textsize(st.transform(word), st.font)[0]+xoff > w * 0.9:
+            for st, wmap in zip(styles, glyph_width_maps):
+                if sum(wmap.get(ch, 4) for ch in st.transform(word)) > w * 0.9:
+                #if draw.textsize(st.transform(word), st.font)[0]+xoff > w * 0.9:
                     if debug:
-                        print("skipping", word, "(too long)")
-                    continue
-            words.append(word)
-            probs.append(float(p))
+                        print("skipping", word, "--- too long in", st.desc)
+                    skipped = True
+                    break
+            if not skipped:
+                words.append(word)
+                probs.append(float(p))
     probs_arr = np.exp(np.array(probs))
     probs_arr /= probs_arr.sum()
     return words, probs_arr
@@ -88,11 +116,13 @@ def load_vocab_probs(size, font, w, h, xoff, styles, debug=False):
 
 class WordDCGAN():
     def __init__(self, width, height, words, word_probs, styles, latent_dim=64):
+
         # Input shape
         self.img_rows = height
         self.img_cols = width
         self.channels = 1
         self.img_shape = (self.img_rows, self.img_cols, self.channels)
+
         self.latent_dim = latent_dim
         self.class_dim = len(styles)
 
@@ -111,9 +141,9 @@ class WordDCGAN():
         self.generator = self.build_generator()
         self.generator.summary()
 
-        # The generator takes noise as input and generates imgs
+        # The generator takes noise/classes as input and generates imgs
         z = Input(shape=(self.latent_dim,))
-        c = Input(shape=(self.class_dim,))
+        c = Input(shape=(1,))
         img = self.generator([z, c])
 
         # For the combined model we will only train the generator
@@ -137,27 +167,28 @@ class WordDCGAN():
 
         # noise input
         z = Input(shape=(self.latent_dim,))
-        dense_z = Dense(128 * y_val * x_val, activation="relu")(z)
-        bnormal_z = BatchNormalization(momentum=0.8)(dense_z)
-        reshape_z = Reshape((y_val, x_val, 128))(bnormal_z)
 
         # class input
-        c = Input(shape=(self.class_dim,))
-        dense_c = Dense(128 * y_val * x_val, activation="relu")(c)
-        bnormal_c = BatchNormalization(momentum=0.8)(dense_c)
-        reshape_c = Reshape((y_val, x_val, 128))(bnormal_c)
+        c = Input(shape=(1,), dtype='int32')
+        c_embed = Embedding(self.class_dim, self.latent_dim,
+            embeddings_initializer='glorot_uniform')(c)
+        c_bnormal = BatchNormalization(momentum=0.8)(c_embed)
 
-        # combined
-        zc = Concatenate()([reshape_z, reshape_c])
+        # combo
+        zc = multiply([z, c_bnormal])
 
-        upsample1 = UpSampling2D()(zc)
+        dense = Dense(128 * y_val * x_val, activation="relu")(zc)
+        reshape = Reshape((y_val, x_val, 128))(dense)
+        upsample1 = UpSampling2D()(reshape)
         conv2d1 = Conv2D(128, kernel_size=3, padding="same")(upsample1)
         bnormal1 = BatchNormalization(momentum=0.8)(conv2d1)
-        relu1 = Activation("relu")(bnormal1)
+        #relu1 = Activation("relu")(bnormal1)
+        relu1 = LeakyReLU(alpha=0.2)(bnormal1)
         upsample2 = UpSampling2D()(relu1)
         conv2d2 = Conv2D(64, kernel_size=3, padding="same")(upsample2)
         bnormal2 = BatchNormalization(momentum=0.8)(conv2d2)
-        relu2 = Activation("relu")(bnormal2)
+        #relu2 = Activation("relu")(bnormal2)
+        relu2 = LeakyReLU(alpha=0.2)(bnormal2)
         conv2d3 = Conv2D(self.channels, kernel_size=3, padding="same",
                 activation="tanh")(relu2)
 
@@ -165,11 +196,20 @@ class WordDCGAN():
 
     def build_discriminator(self):
 
-        #model = Sequential()
-
         input_img = Input(self.img_shape)
+
+        # class input
+        c = Input(shape=(1,), dtype='int32')
+        c_embed = Embedding(self.class_dim,
+                (self.img_shape[0]*self.img_shape[1]*self.img_shape[2]),
+                embeddings_initializer='glorot_uniform')(c)
+        c_embed_reshape = Reshape(self.img_shape)(c_embed)
+        #c_bnormal = BatchNormalization(momentum=0.8)(c_embed_reshape)
+
+        zc = multiply([input_img, c_embed_reshape])
+
         conv2d_img1 = Conv2D(32, kernel_size=3, strides=2,
-                input_shape=self.img_shape, padding="same")(input_img)
+                input_shape=self.img_shape, padding="same")(zc)
         lrlu_img1 = LeakyReLU(alpha=0.2)(conv2d_img1)
         dropout_img1 = Dropout(0.25)(lrlu_img1)
         conv2d_img2 = Conv2D(64, kernel_size=3, strides=2,
@@ -188,23 +228,12 @@ class WordDCGAN():
         bnormal_img3 = BatchNormalization(momentum=0.8)(conv2d_img4)
         lrlu_img4 = LeakyReLU(alpha=0.2)(bnormal_img3)
         dropout_img4 = Dropout(0.25)(lrlu_img4)
-
-        x_val = int(self.img_cols / 8) + 1
-        y_val = int(self.img_rows / 8) + 1
-
-        c = Input(shape=(self.class_dim,))
-        dense_c = Dense(256 * x_val * y_val, activation="relu")(c)
-        bnormal_c = BatchNormalization(momentum=0.8)(dense_c)
-        reshape_c = Reshape((y_val, x_val, 256))(dense_c)
-
-        imgc = Concatenate()([dropout_img4, reshape_c])
-
-        flat = Flatten()(imgc)
-        dense_out = Dense(1, activation='sigmoid')(flat)
+        flatten = Flatten()(dropout_img4)
+        dense_out = Dense(1, activation='sigmoid')(flatten)
 
         return Model([input_img, c], dense_out)
 
-    def train(self, epochs, batch_size=128, save_interval=50):
+    def train(self, epochs, batch_size=128, save_interval=50, word_dist='unigram'):
 
         tstamp = datetime.datetime.utcnow().isoformat()[:19]
         print("starting training at", tstamp)
@@ -225,13 +254,15 @@ class WordDCGAN():
 
             # Sample noise and generate a batch of new images
             noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-            gen_imgs = self.generator.predict([noise, classes])
+            rand_classes = np.random.randint(0, self.class_dim,
+                    size=batch_size)
+            gen_imgs = self.generator.predict([noise, rand_classes])
 
-            # Train the discriminator (real classified as ones and generated as zeros)
+            # Train the discriminator (real as ones and generated as zeros)
             d_loss_real = self.discriminator.train_on_batch(
                     [imgs, classes], valid)
             d_loss_fake = self.discriminator.train_on_batch(
-                    [gen_imgs, classes], fake)
+                    [gen_imgs, rand_classes], fake)
             d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
             # ---------------------
@@ -239,10 +270,11 @@ class WordDCGAN():
             # ---------------------
 
             # Train the generator (wants discriminator to mistake images as real)
-            g_loss = self.combined.train_on_batch([noise, classes], valid)
+            g_loss = self.combined.train_on_batch([noise, rand_classes], valid)
 
             # Plot the progress
-            print ("%s %d [D loss: %f, acc.: %.2f%%] [G loss: %f]" % (tstamp, epoch, d_loss[0], 100*d_loss[1], g_loss))
+            print ("%s %d [D loss: %f, acc.: %.2f%%] [G loss: %f]" % \
+                    (tstamp, epoch, d_loss[0], 100*d_loss[1], g_loss))
 
             # If at save interval => save generated image samples
             if epoch % save_interval == (save_interval - 1):
@@ -275,6 +307,40 @@ class WordDCGAN():
         plt.close()
 
 
+"""
+
+{
+    'styles': [
+        {
+            'font': 'foo.ttf',
+            'transform': 'lc',
+            'label': 0,
+            'size': 12
+        }
+    ]
+}
+
+"""
+def readstyleconf(fh):
+    data = json.load(fh)
+    styles_def = data['styles']
+    transforms = {
+        'ucfirst': ucfirst,
+        'allcaps': allcaps,
+        'randpunct': randpunct,
+        'none': lambda x: x
+    }
+    styles = []
+    for sdict in styles_def:
+        style = Style(
+            desc=sdict['desc'],
+            transform=transforms[sdict['transform']],
+            font=ImageFont.truetype(sdict['font'], size=sdict['size']),
+            size=sdict['size'],
+            label=sdict['label'])
+        styles.append(style)
+    return styles
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
@@ -290,25 +356,14 @@ if __name__ == '__main__':
             default=32,
             help='height of generated word bitmaps (should be power of 2)')
     parser.add_argument(
-            '--font-file',
-            type=str,
-            default='NotoSans-Regular.ttf',
-            help='truetype font to use')
-    parser.add_argument(
-            '--text-style',
-            choices=['ucfirst', 'randpunct', 'none'],
-            default='none',
-            help='orthographic transformation to apply to words')
+            '--style-conf',
+            type=argparse.FileType('r'),
+            help='json file with config for text fonts/sizes/labels')
     parser.add_argument(
             '--word-dist',
             choices=['unigram', 'uniform'],
             default='unigram',
             help='word distribution (unigram=spacy unigram frequency, uniform=uniform probability)')
-    parser.add_argument(
-            '--font-size',
-            type=int,
-            default=18,
-            help='size of font when creating bitmaps')
     parser.add_argument(
             '--epochs',
             type=int,
@@ -331,31 +386,31 @@ if __name__ == '__main__':
             help='latent dimension count')
     args = parser.parse_args()
 
+    with args.style_conf as fh:
+        print("reading styles...")
+        styles = readstyleconf(fh)
 
-    font = ImageFont.truetype(args.font_file, size=args.font_size)
-    style = {'ucfirst': ucfirst,
-             'allcaps': allcaps,
-             'randpunct': randpunct,
-             'none': lambda x: x}[args.text_style]
-
+    print("loading word probabilities...")
     words, word_probs = load_vocab_probs(
-            args.font_size,
-            font,
             args.img_width,
             args.img_height,
             args.img_width * 0.05,
-            style)
+            styles,
+            debug=True)
 
+    print("initializing DCGAN model...")
     dcgan = WordDCGAN(
             args.img_width,
             args.img_height,
-            words, word_probs,
+            words,
+            word_probs,
+            styles,
             args.latent_dim)
+
+    print("training DCGAN model...")
     dcgan.train(
             epochs=args.epochs,
-            font=font,
             batch_size=args.batch_size,
             save_interval=args.save_interval,
-            style=style,
             word_dist=args.word_dist)
 
